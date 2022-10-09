@@ -3,8 +3,11 @@ package net.foxgenesis.watame;
 import java.io.IOException;
 import java.sql.SQLException;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.List;
+import java.util.Objects;
 
+import javax.annotation.Nonnull;
 import javax.security.auth.login.LoginException;
 
 import org.slf4j.Logger;
@@ -15,11 +18,16 @@ import net.dv8tion.jda.api.JDA.Status;
 import net.dv8tion.jda.api.JDABuilder;
 import net.dv8tion.jda.api.OnlineStatus;
 import net.dv8tion.jda.api.entities.Activity;
+import net.dv8tion.jda.api.entities.Guild;
+import net.dv8tion.jda.api.interactions.commands.build.CommandData;
 import net.dv8tion.jda.api.requests.GatewayIntent;
 import net.dv8tion.jda.api.utils.MemberCachePolicy;
+import net.dv8tion.jda.api.utils.cache.SnowflakeCacheView;
 import net.foxgenesis.watame.functionality.ABotFunctionality;
-import net.foxgenesis.watame.sql.DatabaseHandler;
-import net.foxgenesis.watame.sql.WatameDatabase;
+import net.foxgenesis.watame.functionality.InteractionHandler;
+import net.foxgenesis.watame.sql.DataManager;
+import net.foxgenesis.watame.sql.IDatabaseManager;
+import net.foxgenesis.watame.test.TestModule;
 
 /**
  * Class containing WatameBot implementation
@@ -36,30 +44,38 @@ public class WatameBot {
 	 * the JDA object
 	 */
 	private final JDA discord;
-	
+
 	/**
 	 * Database connection handler
 	 */
-	private final WatameDatabase database;
-	
+	private final DataManager database;
+
 	/**
 	 * Current state of the bot
 	 */
 	private State state = State.CONSTRUCTING;
 
 	/**
+	 * List of all plugins
+	 */
+	private List<ABotFunctionality> plugins = new ArrayList<>();
+
+	/**
 	 * Create a new instance with a specified login {@code token}.
 	 * 
 	 * @param token - Token used to connect to discord
-	 * @throws SQLException - When failing to connect to the
-	 * database file
+	 * @throws SQLException - When failing to connect to the database file
 	 */
-	public WatameBot(String token) throws SQLException {
+	public WatameBot(@Nonnull String token) throws SQLException {
+		Objects.requireNonNull(token);
+
 		// Create connection to discord through our token
 		discord = createJDA(token);
-		
+
 		// Connect to our database file
-		database = new WatameDatabase();
+		database = new DataManager();
+
+		plugins.add(new TestModule());
 	}
 
 	/**
@@ -68,22 +84,52 @@ public class WatameBot {
 	protected void preInit() {
 		// Set our state to pre-init
 		state = State.PRE_INIT;
-		
+		logger.trace("STATE = " + state);
+
 		// Display our game as starting up
 		logger.debug("Setting presence to initalizing");
 		discord.getPresence().setPresence(OnlineStatus.DO_NOT_DISTURB, Activity.playing("Initializing..."));
-		
+
+		// Setup and connect to the database
+		databaseInit();
+
+		// Pre-initialize all plugins
+		plugins.parallelStream().forEach(discord::addEventListener);
+
+		// Pre-initialize all plugins
+		plugins.parallelStream().forEach(plugin -> plugin.preInit(this));
+	}
+
+	/**
+	 * Setup and connect to the database
+	 */
+	private void databaseInit() {
 		// Setup database with a specific resource
 		logger.debug("Setting up database...");
 		try {
-			database.setupDatabase(Constants.DATABASE_SETUP_FILE);
+			logger.trace("Connecting to database");
+			database.connect();
 		} catch (IOException e) {
 			// Some error occurred while setting up database
 			ExitCode.DATABASE_SETUP_ERROR.programExit(e);
-		} catch(IllegalArgumentException e) {
+		} catch (IllegalArgumentException e) {
 			// Resource was null
 			ExitCode.DATABASE_INVALID_SETUP_FILE.programExit(e);
+		} catch (UnsupportedOperationException e) {
+			// Unable to connect to database
+			ExitCode.DATABASE_NOT_CONNECTED.programExit(e);
+		} catch (SQLException e) {
+			// Error while accessing database
+			ExitCode.DATABASE_ACCESS_ERROR.programExit(e);
 		}
+
+		// Add all guilds that will be used to the database
+		logger.trace("Adding guilds to data manager");
+		discord.getGuildCache().acceptStream(stream -> stream.parallel().forEach(database::addGuild));
+
+		// Get all database data
+		logger.trace("Retrieving all data");
+		database.retrieveDatabaseData(discord);
 	}
 
 	/**
@@ -92,6 +138,25 @@ public class WatameBot {
 	protected void init() {
 		// Set our state to init
 		state = State.INIT;
+		logger.trace("STATE = " + state);
+
+		// Initialize all plugins
+		plugins.parallelStream().forEach(ABotFunctionality::init);
+		
+		// Get global and guild interactions
+		logger.trace("Getting integrations");
+		SnowflakeCacheView<Guild> guildCache = discord.getGuildCache();
+		
+		Collection<CommandData> interactions = plugins.parallelStream()
+				.map(plugin -> ((InteractionHandler) plugin.getInteractionHandler()).getAllInteractions(guildCache))
+				.filter(cmdData -> cmdData != null).reduce((a, b) -> {
+					a.addAll(b);
+					return a;
+				}).orElse(new ArrayList<CommandData>());
+
+		// Tell JDA to update our command list
+		logger.info("Adding {} integrations", interactions.size());
+		discord.updateCommands().addCommands(interactions).queue();
 	}
 
 	/**
@@ -100,13 +165,18 @@ public class WatameBot {
 	protected void postInit() {
 		// Set our state to post-init
 		state = State.POST_INIT;
-		
+		logger.trace("STATE = " + state);
+
+		// Post-initialize all plugins
+		plugins.parallelStream().forEach(ABotFunctionality::postInit);
+
 		// Display our game as ready
 		logger.debug("Setting presence to ready");
 		discord.getPresence().setPresence(OnlineStatus.ONLINE, Activity.playing("type <help>"));
-		
+
 		// Set our state to running
 		state = State.RUNNING;
+		logger.trace("STATE = " + state);
 	}
 
 	/**
@@ -115,7 +185,7 @@ public class WatameBot {
 	 * @param token - Token used to connect to discord
 	 * @return connected JDA object
 	 */
-	private JDA createJDA(String token) {
+	private JDA createJDA(@Nonnull String token) {
 		JDA discordTmp = null;
 		boolean connected = false;
 
@@ -178,11 +248,11 @@ public class WatameBot {
 			logger.debug("Shutting down JDA...");
 			discord.shutdown();
 		}
-		
+
 		try {
 			logger.debug("Closing database connection");
-			database.shutdown();
-		} catch (SQLException e) {
+			database.close();
+		} catch (Exception e) {
 			logger.error("Error while closing database connection!", e);
 		}
 
@@ -200,51 +270,40 @@ public class WatameBot {
 	}
 
 	/**
-	 * Checks if the connection to the database is valid
-	 * @return Returns {@code true} if connected to the
-	 * database
-	 * @see WatameDatabase#isValid()
-	 */
-	public boolean isConnectedToDatabase() {
-		return database.isValid();
-	}
-	
-	/**
 	 * NEED_JAVADOC
+	 * 
 	 * @return
 	 */
-	public DatabaseHandler getDatabase() {
+	public IDatabaseManager getDatabase() {
 		return database;
 	}
-	
+
 	/**
 	 * NEED_JAVADOC
+	 * 
 	 * @return
 	 */
 	public JDA getJDA() {
 		return discord;
 	}
-	
+
 	/**
 	 * Get the current state of the bot.
+	 * 
 	 * @return Returns the {@link State} of the bot
 	 * @see State
 	 */
 	public State getState() {
 		return state;
 	}
-	
+
 	/**
-	 * States {@link WatameBot} goes through
-	 * on startup.
+	 * States {@link WatameBot} goes through on startup.
+	 * 
 	 * @author Ashley
 	 */
 	public enum State {
-		//NEED_JAVADOC javadoc needed for enum
-		CONSTRUCTING,
-		PRE_INIT,
-		INIT,
-		POST_INIT,
-		RUNNING
+		// NEED_JAVADOC javadoc needed for enum
+		CONSTRUCTING, PRE_INIT, INIT, POST_INIT, RUNNING
 	}
 }

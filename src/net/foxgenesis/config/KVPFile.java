@@ -7,6 +7,7 @@ import java.net.URL;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
+import java.util.function.BiConsumer;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
 
@@ -57,6 +58,20 @@ public class KVPFile {
 		// Ensure url is not null
 		Objects.nonNull(url);
 		this.resourceURL = url;
+	}
+
+	/**
+	 * Performs the given action for each entry in this map until all entrieshave
+	 * been processed or the action throws an exception. Unlessotherwise specified
+	 * by the implementing class, actions are performed inthe order of entry set
+	 * iteration (if an iteration order is specified.)Exceptions thrown by the
+	 * action are relayed to the caller.
+	 * 
+	 * @param action - The action to be performed for each entry
+	 * @see Map#forEach(BiConsumer)
+	 */
+	public void forEach(BiConsumer<? super String, ? super String> action) {
+		config.forEach(action);
 	}
 
 	/**
@@ -113,19 +128,17 @@ public class KVPFile {
 	/**
 	 * Parse the resource {@link URL} into the configuration mapping.
 	 * 
-	 * @throws IOException
+	 * @throws IOException Thrown if an error occurs while reading the InputStream
+	 *                     of the resource
 	 */
 	public void parse() throws IOException {
 		/*
-		 *  - Read all lines
-		 *  - Filter out ignored lines
-		 *  - Split line based on regex with limit of two
-		 *  - Ensure split has two elements
-		 *  - Collect into a map
+		 * - Read all lines - Filter out ignored lines - Split line based on regex with
+		 * limit of two - Ensure split has two elements - Collect into a map
 		 */
 		Map<String, String> tempMap = ResourceHelper.linesFromResource(resourceURL).stream().filter(ignoreLines)
 				.map(line -> line.split("=", 2)).filter(split -> split.length == 2)
-				.collect(Collectors.toMap(split -> split[0], split -> split[1]));
+				.collect(Collectors.toMap(split -> split[0].trim(), split -> split[1].trim()));
 
 		// Put all pairs into main map
 		config.putAll(tempMap);
